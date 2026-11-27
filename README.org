@@ -1,0 +1,7 @@
+* 手帳 Techō.el
+
+Emacs client for [[https://github.com/Kiyomi-Computation-Systems/techo][Techō]], a personal online notebook.
+
+#+begin_quote
+✨ *AI Disclosure:* LLMs are used extensively in the planning and development of this project.
+#+end_quote
