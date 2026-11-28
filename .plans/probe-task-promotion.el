@@ -14,6 +14,19 @@
   "** TODO Send proofs :press:\nDEADLINE: <2026-12-01 Tue>\n:PROPERTIES:\n:CLIENT: Maya\n:END:\nUse crème stock.\n*** Samples\n- [ ] Blue sheet\n")
 (defconst techo-promo-tail "** TODO Send proofs\nDifferent job, same title.\n")
 (defconst techo-promo-todos "#+title: TODOs\n* TODO Pay printer\nKeep this local.\n")
+(defconst techo-promo-intent-schema
+  "CREATE TABLE intent(id TEXT PRIMARY KEY, source_id TEXT, src0 TEXT, src1 TEXT,
+                       entry TEXT, capture_started INTEGER NOT NULL DEFAULT 0)")
+
+(defun techo-promo-entries (text id)
+  "Return the Org heading subtrees in TEXT with the direct ID property ID."
+  (with-temp-buffer
+    (insert text) (org-mode)
+    (org-element-map (org-element-parse-buffer) 'headline
+      (lambda (heading)
+        (goto-char (org-element-property :begin heading))
+        (when (equal (org-entry-get nil "ID") id)
+          (buffer-substring-no-properties (point) (save-excursion (org-end-of-subtree t t))))))))
 
 (defun techo-promo-text (file)
   (with-temp-buffer (insert-file-contents file) (buffer-string)))
@@ -49,10 +62,12 @@
         (org-entry-put nil "ID" techo-promo-id)
         (org-entry-put nil "TECHO_KIND" "task"))
       (setq target-after (buffer-string)))
-    (with-sqlite-transaction db
-      (sqlite-execute db "INSERT INTO intent(id,source_id,src0,src1,dst0,dst1) VALUES (?,?,?,?,?,?)"
-                      (list techo-promo-id techo-probe-id before source-after todos target-after))
-      (techo-probe-cut dir cut 'before-intent-commit))
+    (let ((entries (techo-promo-entries target-after techo-promo-id)))
+      (techo-probe-check (= 1 (length entries)) "Ambiguous target ID")
+      (with-sqlite-transaction db
+        (sqlite-execute db "INSERT INTO intent(id,source_id,src0,src1,entry) VALUES (?,?,?,?,?)"
+                        (list techo-promo-id techo-probe-id before source-after (car entries)))
+        (techo-probe-cut dir cut 'before-intent-commit)))
     (techo-probe-cut dir cut 'intent-committed)))
 
 (defun techo-promo-state (text before after)
@@ -61,17 +76,28 @@
         (t 'diverged)))
 
 (defun techo-promo-apply (db dir &optional cut)
-  (let ((row (car (sqlite-select db "SELECT id,source_id,src0,src1,dst0,dst1 FROM intent"))))
+  (let ((row (car (sqlite-select db "SELECT id,source_id,src0,src1,entry,capture_started FROM intent"))))
     (when row
-      (pcase-let* ((`(,id ,source-id ,src0 ,src1 ,dst0 ,dst1) row)
+      (pcase-let* ((`(,id ,source-id ,src0 ,src1 ,entry ,started) row)
                    (src (expand-file-name "meeting.org" dir))
                    (dst (expand-file-name "todos.org" dir))
                    (from (techo-promo-state (techo-promo-text src) src0 src1))
-                   (to (techo-promo-state (techo-promo-text dst) dst0 dst1)))
+                   (current (techo-promo-text dst))
+                   (matches (techo-promo-entries current id))
+                   (to (cond ((and (= started 1) (equal matches (list entry))) 'after)
+                             ((and (zerop started) (null matches)) 'before)
+                             (t 'diverged))))
         (if (or (eq from 'diverged) (eq to 'diverged)
                 (and (eq from 'after) (eq to 'before)))
             'review
-          (when (eq to 'before) (techo-promo-save dst dst1))
+          (when (eq to 'before)
+            ;; After this durable marker, absence could mean a user's deletion.
+            (sqlite-execute db "UPDATE intent SET capture_started=1 WHERE id=?" (list id))
+            (techo-probe-cut dir cut 'before-task-write)
+            (techo-promo-save dst (concat current
+                                          (unless (or (string-empty-p current)
+                                                      (string-suffix-p "\n" current)) "\n")
+                                          entry)))
           (techo-probe-cut dir cut 'task-saved)
           (when (eq from 'before) (techo-promo-save src src1))
           (techo-probe-cut dir cut 'link-saved)
@@ -95,15 +121,16 @@
   (techo-probe-run-to-cut techo-promo-source (list 'techo-promo-child dir (list 'quote cut))
                           dir cut))
 
-(defun techo-promo-verify (db dir)
+(defun techo-promo-verify (db dir &optional todos-prefix)
   (let ((file (expand-file-name "todos.org" dir)))
+    (setq todos-prefix (or todos-prefix techo-promo-todos))
     (techo-probe-check (equal (techo-promo-text (expand-file-name "meeting.org" dir))
                               (concat techo-promo-prefix techo-promo-link "\n" techo-promo-tail))
                        "Incorrect source replacement")
     (with-temp-buffer
       (insert-file-contents file) (org-mode) (goto-char (point-min))
-      (techo-probe-check (looking-at-p (regexp-quote techo-promo-todos)) "Unrelated Task changed")
-      (goto-char (+ (point-min) (length techo-promo-todos)))
+      (techo-probe-check (looking-at-p (regexp-quote todos-prefix)) "Unrelated Task changed")
+      (goto-char (+ (point-min) (length todos-prefix)))
       (techo-probe-check (and (= (org-outline-level) 1)
                               (equal (org-get-todo-state) "TODO")
                               (equal (org-get-heading t t t t) "Send proofs")
@@ -142,14 +169,14 @@
          (src (expand-file-name "meeting.org" dir))
          (dst (expand-file-name "todos.org" dir))
          (original (concat techo-promo-prefix techo-promo-subtree techo-promo-tail))
-         db)
+         db todos-prefix)
     (unwind-protect
         (progn
           (techo-promo-save src original)
           (techo-promo-save dst techo-promo-todos)
           (setq db (techo-probe-open dir))
           (sqlite-select db "PRAGMA journal_mode=WAL")
-          (sqlite-execute db "CREATE TABLE intent(id TEXT PRIMARY KEY, source_id TEXT, src0 TEXT, src1 TEXT, dst0 TEXT, dst1 TEXT)")
+          (sqlite-execute db techo-promo-intent-schema)
           (sqlite-execute db "CREATE TABLE pending(id TEXT PRIMARY KEY, op TEXT)")
           (sqlite-close db) (setq db nil)
           (techo-promo-interrupt dir cut)
@@ -173,9 +200,18 @@
                                "Uncommitted intent changed files")
             ;; The user's command did not commit. Retry it explicitly.
             (techo-promo-prepare db dir nil))
-          (if (memq variant '(edit-source edit-target))
-              (let ((changed (if (eq variant 'edit-source) src dst)))
-                (append-to-file "New user edit.\n" nil changed)
+          (pcase variant
+            ('edit-source (append-to-file "New user edit.\n" nil src))
+            ('edit-target (append-to-file "New user edit.\n" nil dst))
+            ('remove-target (techo-promo-save dst techo-promo-todos))
+            ('duplicate-target
+             (let ((entry (car (techo-promo-entries (techo-promo-text dst) techo-promo-id))))
+               (append-to-file entry nil dst)))
+            ('edit-sibling
+             (setq todos-prefix (string-replace "Pay printer" "Pay studio" techo-promo-todos))
+             (techo-promo-save dst (string-replace techo-promo-todos todos-prefix (techo-promo-text dst)))))
+          (if (or (eq cut 'before-task-write)
+                  (memq variant '(edit-source edit-target remove-target duplicate-target)))
                 (let ((left (techo-promo-text src)) (right (techo-promo-text dst)))
                   (dotimes (_ 2)
                     (techo-probe-check (eq 'review (techo-promo-apply db dir)) "Expected review")
@@ -183,18 +219,19 @@
                                             (equal right (techo-promo-text dst))
                                             (sqlite-select db "SELECT id FROM intent")
                                             (null (sqlite-select db "SELECT * FROM pending")))
-                                       "Divergent content or intent lost"))))
+                                       "Divergent content or intent lost")))
             (dotimes (_ 2)
               (techo-promo-apply db dir)
-              (techo-promo-verify db dir)))
+              (techo-promo-verify db dir todos-prefix)))
           (princ (format "PASS %s%s\n" cut (if variant (format " / %s" variant) ""))))
       (when db (sqlite-close db))
       (delete-directory dir t))))
 
 (defun techo-probe-task-promotion ()
-  (dolist (cut '(before-intent-commit intent-committed task-saved link-saved before-final-commit final-committed))
+  (dolist (cut '(before-intent-commit intent-committed before-task-write task-saved link-saved before-final-commit final-committed))
     (techo-promo-case cut))
-  (dolist (variant '(second-crash edit-source edit-target))
-    (techo-promo-case 'task-saved variant)))
+  (dolist (variant '(second-crash edit-source edit-target remove-target duplicate-target edit-sibling))
+    (techo-promo-case 'task-saved variant))
+  (techo-promo-case 'intent-committed 'edit-sibling))
 
 ;;; probe-task-promotion.el ends here

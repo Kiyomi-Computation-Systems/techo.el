@@ -72,8 +72,8 @@
           (techo-promo-save dst techo-hooks-todos)
           (setq db (techo-probe-open dir))
           (sqlite-select db "PRAGMA journal_mode=WAL")
-          (dolist (sql '("CREATE TABLE intent(id TEXT PRIMARY KEY, source_id TEXT, src0 TEXT, src1 TEXT, dst0 TEXT, dst1 TEXT)"
-                         "CREATE TABLE base(id TEXT PRIMARY KEY, digest TEXT)"
+          (sqlite-execute db techo-promo-intent-schema)
+          (dolist (sql '("CREATE TABLE base(id TEXT PRIMARY KEY, digest TEXT)"
                          "CREATE TABLE pending(id TEXT PRIMARY KEY, op TEXT)"
                          "CREATE TABLE hook_log(file TEXT, eligible INTEGER)"
                          "CREATE VIEW reserved AS SELECT id FROM intent UNION SELECT source_id FROM intent"
@@ -106,27 +106,26 @@
                                     (equal (sqlite-select db "SELECT id FROM pending")
                                            (list (list techo-probe-id))))
                                "Restart scan published work or erased the queued source")
-            (if (eq variant 'sibling)
-                (progn
-                  (techo-promo-save dst (string-replace "Smyth sewn." "Hand sewn." (techo-promo-text dst)))
-                  (techo-probe-check (equal (techo-hooks-eligible db) (list techo-hooks-sibling))
-                                     "An unrelated saved Task should be dispatchable")
-                  (techo-probe-check (eq 'review (techo-promo-apply db dir)) "Expected conservative review")
-                  (techo-probe-check (and (equal (techo-hooks-eligible db) (list techo-hooks-sibling))
-                                          (string-search "Hand sewn." (techo-promo-text dst))
-                                          (string-search techo-promo-subtree (techo-promo-text src)))
-                                     "Review lost the edit or released reserved nodes"))
+            (when (eq variant 'sibling)
+              (techo-promo-save dst (string-replace "Smyth sewn." "Hand sewn." (techo-promo-text dst)))
+              (techo-probe-check (equal (techo-hooks-eligible db) (list techo-hooks-sibling))
+                                 "An unrelated saved Task should be dispatchable"))
+            (let ((capture-before (techo-promo-text dst)))
               (techo-probe-check (eq 'complete (techo-promo-apply db dir)) "Recovery failed")
-              (techo-probe-check
-               (equal (sqlite-select db "SELECT file,eligible FROM hook_log ORDER BY rowid")
-                      '(("todos.org" 0) ("meeting.org" 0))) "Source hook observed partial publication")
-              (dotimes (_ 2)
-                (dolist (f files)
-                  (techo-hooks-read-file f (lambda () (techo-hooks-index db)))))
-              (techo-probe-check
-               (equal (sqlite-select db "SELECT id,op FROM eligible ORDER BY id")
-                      (list (list techo-probe-id "update") (list techo-promo-id "create")))
-               "Completion did not release exactly the two intended operations")))
+              (techo-probe-check (equal capture-before (techo-promo-text dst))
+                                 "Recovery rewrote the capture file"))
+            (techo-probe-check
+             (equal (sqlite-select db "SELECT file,eligible FROM hook_log ORDER BY rowid")
+                    (append '(("todos.org" 0)) (when (eq variant 'sibling) '(("todos.org" 0)))
+                            '(("meeting.org" 0)))) "Save hooks saw partial publication")
+            (dotimes (_ 2)
+              (dolist (f files)
+                (techo-hooks-read-file f (lambda () (techo-hooks-index db)))))
+            (techo-probe-check
+             (equal (sqlite-select db "SELECT id,op FROM eligible ORDER BY id")
+                    (append (list (list techo-probe-id "update") (list techo-promo-id "create"))
+                            (when (eq variant 'sibling) (list (list techo-hooks-sibling "update")))))
+             "Unexpected eligible operations"))
           (princ (format "PASS promotion hooks / %s\n" variant)))
       (when db (sqlite-close db))
       (delete-directory dir t))))
